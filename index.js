@@ -7,8 +7,7 @@ export default {
       const targetUrl = decodeURIComponent(url.pathname.slice(7));
       
       try {
-        const parsedUrl = new URL(targetUrl);
-        return await handleProxyRequest(request, targetUrl, parsedUrl);
+        return await handleProxyRequest(request, targetUrl);
       } catch (error) {
         return new Response(`Error: ${error.message}`, { 
           status: 400,
@@ -27,25 +26,13 @@ export default {
           body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
           h1 { color: #8B5CF6; }
           .info { background: #f5f5f5; padding: 15px; border-radius: 5px; }
-          .tip { background: #e8f4fd; padding: 10px; border-radius: 5px; margin: 10px 0; }
         </style>
       </head>
       <body>
         <h1>🚀 /Purge Full Web Proxy</h1>
         <div class="info">
           <p><strong>Full Web Proxy is running!</strong></p>
-          <p>This proxy rewrites HTML, CSS, and JavaScript to fix all asset links</p>
           <p>Use: <code>/proxy/URL</code> to access websites</p>
-          <p>Example: <code>https://purge-proxy.joshaburrjr.workers.dev/proxy/https://orteil.dashnet.org/cookieclicker/</code></p>
-        </div>
-        <div class="tip">
-          <p><strong>Features:</strong></p>
-          <ul>
-            <li>✅ Rewrites HTML URLs</li>
-            <li>✅ Handles JavaScript and CSS</li>
-            <li>✅ Processes images and assets</li>
-            <li>✅ Fixes relative paths</li>
-          </ul>
         </div>
       </body>
       </html>
@@ -55,35 +42,57 @@ export default {
   }
 }
 
-async function handleProxyRequest(request, targetUrl, parsedUrl) {
+async function handleProxyRequest(request, targetUrl) {
+  const parsedUrl = new URL(targetUrl);
+  
+  // Better headers to avoid Cloudflare blocking
   const headers = new Headers({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept-Encoding': 'identity', // Don't accept compressed content for easier processing
     'Cache-Control': 'no-cache',
     'DNT': '1',
-    'Upgrade-Insecure-Requests': '1'
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1'
   });
+
+  // Add host header to avoid Cloudflare direct IP block
+  headers.set('Host', parsedUrl.hostname);
 
   // Copy referer if present
   const referer = request.headers.get('Referer');
-  if (referer) headers.set('Referer', referer);
+  if (referer) {
+    headers.set('Referer', referer);
+  }
 
   const proxyRequest = new Request(targetUrl, {
     method: request.method,
     headers: headers,
     body: request.body,
-    redirect: 'follow'
+    redirect: 'manual' // Handle redirects manually
   });
 
   let response = await fetch(proxyRequest);
+  
+  // Handle redirects manually
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get('Location');
+    if (location) {
+      const redirectUrl = new URL(location, targetUrl).toString();
+      return handleProxyRequest(request, redirectUrl);
+    }
+  }
+
   const contentType = response.headers.get('content-type') || '';
 
   // Rewrite content based on type
   if (contentType.includes('text/html')) {
     let html = await response.text();
-    html = rewriteHtmlUrls(html, targetUrl);
+    html = rewriteAllUrls(html, targetUrl);
     response = new Response(html, response);
     response.headers.set('Content-Type', 'text/html');
     
@@ -114,67 +123,47 @@ async function handleProxyRequest(request, targetUrl, parsedUrl) {
   return response;
 }
 
-function rewriteHtmlUrls(html, baseUrl) {
+function rewriteAllUrls(content, baseUrl) {
   const base = new URL(baseUrl);
-  const proxyBase = 'https://purge-proxy.joshaburrjr.workers.dev/proxy/';
+  const proxyBase = 'https://purgewisp.joshaburrjr.workers.dev/proxy/';
   
-  return html
-    // href attributes
-    .replace(/href="([^"]*)"/gi, (match, url) => {
-      if (url.startsWith('javascript:') || url.startsWith('mailto:') || url.startsWith('#')) {
-        return match;
-      }
-      const fullUrl = resolveUrl(url, base);
-      return `href="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-    })
-    // src attributes
-    .replace(/src="([^"]*)"/gi, (match, url) => {
-      const fullUrl = resolveUrl(url, base);
-      return `src="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-    })
-    // action attributes (forms)
-    .replace(/action="([^"]*)"/gi, (match, url) => {
-      const fullUrl = resolveUrl(url, base);
-      return `action="${proxyBase}${encodeURIComponent(fullUrl)}"`;
-    })
-    // CSS url() functions in style attributes
-    .replace(/style="([^"]*)"/gi, (match, style) => {
-      const newStyle = style.replace(/url\(['"]?([^'")]*)['"]?\)/gi, (urlMatch, url) => {
+  // More comprehensive URL rewriting
+  return content
+    // Standard URLs in quotes
+    .replace(/(href|src|action|data|cite|background|poster|srcset|data-src|data-href)=["']([^"']+)["']/gi, 
+      (match, attr, url) => {
+        if (shouldSkipUrl(url)) return match;
         const fullUrl = resolveUrl(url, base);
-        return `url("${proxyBase}${encodeURIComponent(fullUrl)}")`;
-      });
-      return `style="${newStyle}"`;
-    })
-    // srcset attributes
-    .replace(/srcset="([^"]*)"/gi, (match, srcset) => {
-      const newSrcset = srcset.split(',').map(part => {
-        const [url, descriptor] = part.trim().split(/\s+/);
-        if (url) {
-          const fullUrl = resolveUrl(url, base);
-          return `${proxyBase}${encodeURIComponent(fullUrl)}${descriptor ? ' ' + descriptor : ''}`;
-        }
-        return part;
-      }).join(', ');
-      return `srcset="${newSrcset}"`;
-    })
-    // meta refresh URLs
-    .replace(/content="(\d+);\s*url=([^"]*)"/gi, (match, delay, url) => {
+        return `${attr}="${proxyBase}${encodeURIComponent(fullUrl)}"`;
+      })
+    
+    // CSS url() functions
+    .replace(/url\(['"]?([^'")]+)['"]?\)/gi, (match, url) => {
+      if (shouldSkipUrl(url)) return match;
       const fullUrl = resolveUrl(url, base);
-      return `content="${delay}; url=${proxyBase}${encodeURIComponent(fullUrl)}"`;
+      return `url("${proxyBase}${encodeURIComponent(fullUrl)}")`;
     })
-    // link[rel="icon"] etc.
-    .replace(/<link[^>]*href="([^"]*)"[^>]*>/gi, (match, url) => {
+    
+    // JavaScript strings (basic)
+    .replace(/(['"])(https?:\/\/[^'"]+)\1/gi, (match, quote, url) => {
+      if (shouldSkipUrl(url)) return match;
+      return `${quote}${proxyBase}${encodeURIComponent(url)}${quote}`;
+    })
+    
+    // Meta refresh
+    .replace(/(content|http-equiv)=["']([^"']*;\s*url=([^"']+))["']/gi, (match, attr, content, url) => {
+      if (shouldSkipUrl(url)) return match;
       const fullUrl = resolveUrl(url, base);
-      return match.replace(`href="${url}"`, `href="${proxyBase}${encodeURIComponent(fullUrl)}"`);
+      return `${attr}="${content.replace(url, proxyBase + encodeURIComponent(fullUrl))}"`;
     });
 }
 
 function rewriteCssUrls(css, baseUrl) {
   const base = new URL(baseUrl);
-  const proxyBase = 'https://purge-proxy.joshaburrjr.workers.dev/proxy/';
+  const proxyBase = 'https://purgewisp.joshaburrjr.workers.dev/proxy/';
   
-  return css.replace(/url\(['"]?([^'")]*)['"]?\)/gi, (match, url) => {
-    if (url.startsWith('data:')) return match;
+  return css.replace(/url\(['"]?([^'")]+)['"]?\)/gi, (match, url) => {
+    if (shouldSkipUrl(url)) return match;
     const fullUrl = resolveUrl(url, base);
     return `url("${proxyBase}${encodeURIComponent(fullUrl)}")`;
   });
@@ -182,20 +171,37 @@ function rewriteCssUrls(css, baseUrl) {
 
 function rewriteJsUrls(js, baseUrl) {
   const base = new URL(baseUrl);
-  const proxyBase = 'https://purge-proxy.joshaburrjr.workers.dev/proxy/';
+  const proxyBase = 'https://purgewisp.joshaburrjr.workers.dev/proxy/';
   
-  // Basic URL rewriting in JavaScript (this is simplified)
-  return js.replace(/['"](https?:\/\/[^'"]*)['"]/g, (match, url) => {
-    if (url.includes('purge-proxy.joshaburrjr.workers.dev')) return match;
-    return `"${proxyBase}${encodeURIComponent(url)}"`;
-  });
+  // More comprehensive JS URL rewriting
+  return js
+    .replace(/(['"])(https?:\/\/[^'"]+)\1/gi, (match, quote, url) => {
+      if (shouldSkipUrl(url)) return match;
+      return `${quote}${proxyBase}${encodeURIComponent(url)}${quote}`;
+    })
+    .replace(/(['"])(\/\/[^'"]+)\1/gi, (match, quote, url) => {
+      if (shouldSkipUrl(url)) return match;
+      const fullUrl = `https:${url}`;
+      return `${quote}${proxyBase}${encodeURIComponent(fullUrl)}${quote}`;
+    });
+}
+
+function shouldSkipUrl(url) {
+  return url.startsWith('javascript:') || 
+         url.startsWith('mailto:') || 
+         url.startsWith('tel:') || 
+         url.startsWith('#') ||
+         url.startsWith('data:') ||
+         url.includes('purgewisp.joshaburrjr.workers.dev');
 }
 
 function resolveUrl(url, base) {
   if (!url || url.trim() === '') return base.toString();
   
-  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('//')) {
-    return new URL(url, base).toString();
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    return url;
+  } else if (url.startsWith('//')) {
+    return `https:${url}`;
   } else if (url.startsWith('/')) {
     return `${base.origin}${url}`;
   } else {
