@@ -1,0 +1,6 @@
+name = "purge-proxy"
+main = "src/index.js"
+compatibility_date = "2024-11-15"
+
+[vars]
+PROXY_NAME = "/Purge Full Proxy"
